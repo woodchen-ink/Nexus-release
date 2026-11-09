@@ -1,4 +1,4 @@
-# 编译与发布 Nexus 桌面客户端（Windows x64 / arm64、macOS universal、Linux x64 / arm64）。
+# 编译与发布 Nexus 客户端（Windows x64 / arm64、macOS universal、Linux x64 / arm64、Android arm64 / x86_64）。
 #
 # 源码在私有仓库，编译放在这个公开仓库里跑：公开仓库的 Actions 不计分钟数，
 # 而私有仓库的 Windows runner 按 2 倍、macOS runner 按 10 倍计费。
@@ -16,7 +16,8 @@
 # 发布契约（CZL Connect 发布源按别名匹配附件名，客户端自动更新与面板下载页都读它的 latest.json，改名须先改别名）：
 #   - 资产沿用 Tauri 默认名：Nexus_<版本>_x64-setup.exe、Nexus_<版本>_arm64-setup.exe、Nexus_<版本>_universal.dmg、
 #     Nexus_<版本>_amd64.deb、Nexus_<版本>_arm64.deb（AppImage 暂不发布）；macOS 另打 Nexus_<版本>_universal.app.tar.gz
-#     供自动更新替换 .app；外加 SHA256SUMS。完整性由 CZL Connect 清单中的 size 与 sha256 校验
+#     供自动更新替换 .app；Android 为 Nexus_<版本>_android-arm64.apk、Nexus_<版本>_android-x64.apk；
+#     外加 SHA256SUMS。完整性由 CZL Connect 清单中的 size 与 sha256 校验
 #   - 带 - 后缀的标签发布为 Pre-release
 #   - 同一标签重跑时覆盖上传资产，不新建重复 Release
 #
@@ -26,6 +27,11 @@
 # Secrets：
 #   SOURCE_REPO_TOKEN                   只对源码仓库有 Contents 只读权限的 fine-grained PAT
 #   PANEL_ENDPOINTS                     客户端内置的面板地址（逗号分隔；放 secret 而非变量，避免出现在公开日志中）
+#   ANDROID_KEYSTORE_BASE64             Android 正式版签名密钥库（.jks 文件的 base64；更换后用户无法覆盖安装，务必固定并备份）
+#   ANDROID_KEYSTORE_PASSWORD           密钥库密码
+#   ANDROID_KEY_ALIAS                   密钥别名
+#   ANDROID_KEY_PASSWORD                密钥密码
+# 源码中没有 client/android 时（旧版本补发）跳过 Android。
 # macOS 使用 tauri.conf.json 中的 ad-hoc 签名（用户首次打开需在“系统设置 → 隐私与安全性”中允许）。
 # 发布用本仓库自带的 GITHUB_TOKEN。
 
@@ -249,8 +255,149 @@ jobs:
           # 只给本次 publish 用，正式产物在 Release 里
           retention-days: 1
 
+  # Android：同一个 Tauri 工程的移动端（源码 client/desktop/src-tauri/gen/android），内核为 gomobile 编译的 mihomo 库（client/android/libcore）
+  android:
+    needs: resolve
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: src/client
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build
+    steps:
+      - name: 拉取源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: src
+          persist-credentials: false
+
+      - name: 是否包含 Android
+        id: has
+        working-directory: .
+        run: |
+          if [ -f src/client/android/build-core.sh ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; else echo "ok=false" >> "$GITHUB_OUTPUT"; echo "::notice::该版本源码没有 Android 工程，跳过"; fi
+
+      - name: 版本号
+        if: steps.has.outputs.ok == 'true' && env.VERSION != ''
+        run: node -e "const f='desktop/package.json';const p=require('./'+f);p.version=process.env.VERSION;require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+
+      - uses: pnpm/action-setup@v4
+        if: steps.has.outputs.ok == 'true'
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        if: steps.has.outputs.ok == 'true'
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: src/client/pnpm-lock.yaml
+      - uses: actions/setup-java@v4
+        if: steps.has.outputs.ok == 'true'
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: actions/setup-go@v5
+        if: steps.has.outputs.ok == 'true'
+        with:
+          go-version-file: src/client/android/libcore/go.mod
+          cache-dependency-path: src/client/android/libcore/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.has.outputs.ok == 'true'
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - name: 缓存周期
+        if: steps.has.outputs.ok == 'true'
+        id: cache-period
+        run: echo "week=$(date -u +%G%V)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        if: steps.has.outputs.ok == 'true'
+        with:
+          key: android-${{ steps.cache-period.outputs.week }}
+          cache-targets: true
+          cache-workspace-crates: false
+          workspaces: src/client/desktop/src-tauri
+
+      - name: Android SDK / NDK
+        if: steps.has.outputs.ok == 'true'
+        # ubuntu-latest 自带 Android SDK 与 NDK
+        run: |
+          echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: 依赖与地理数据
+        if: steps.has.outputs.ok == 'true'
+        run: |
+          pnpm install --frozen-lockfile
+          node desktop/scripts/fetch-core.mjs --geo-only
+
+      - name: 内核 AAR
+        if: steps.has.outputs.ok == 'true'
+        run: |
+          # gomobile 与 libcore 依赖的 golang.org/x/mobile 同一版本
+          MOBILE=$(cd android/libcore && go list -m -f '{{.Version}}' golang.org/x/mobile)
+          go install golang.org/x/mobile/cmd/gomobile@$MOBILE golang.org/x/mobile/cmd/gobind@$MOBILE
+          gomobile init
+          android/build-core.sh android/arm64,android/amd64
+
+      - name: 签名密钥
+        if: steps.has.outputs.ok == 'true'
+        working-directory: src/client/desktop/src-tauri/gen/android
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PUBLISH: ${{ needs.resolve.outputs.publish }}
+        run: |
+          if [ -z "$KEYSTORE" ]; then
+            [ "$PUBLISH" = "true" ] && { echo "::error::未配置 ANDROID_KEYSTORE_BASE64，不能发布未签名的 APK"; exit 1; }
+            echo "::warning::未配置签名密钥，试运行生成未签名的 APK"; exit 0
+          fi
+          echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "storeFile=$RUNNER_TEMP/release.jks"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > keystore.properties
+
+      - name: 构建
+        if: steps.has.outputs.ok == 'true'
+        working-directory: src/client/desktop
+        env:
+          NEXUS_PANEL_ENDPOINTS: ${{ secrets.PANEL_ENDPOINTS }}
+        run: pnpm tauri android build --apk --split-per-abi --target aarch64 --target x86_64
+
+      - name: 收集产物
+        if: steps.has.outputs.ok == 'true'
+        working-directory: src/client/desktop/src-tauri/gen/android/app/build/outputs/apk
+        run: |
+          OUT="$GITHUB_WORKSPACE/out"; mkdir -p "$OUT"
+          V=$(node -p "require(process.env.GITHUB_WORKSPACE + '/src/client/desktop/package.json').version")
+          find . -name '*.apk' -print
+          for abi in arm64:arm64 x86_64:x64; do
+            f=$(find "${abi%%:*}" -name '*.apk' | head -1)
+            [ -n "$f" ] || { echo "::error::没有找到 ${abi%%:*} 的 APK"; exit 1; }
+            cp -f "$f" "$OUT/Nexus_${V}_android-${abi##*:}.apk"
+          done
+          rm -f keystore.properties "$RUNNER_TEMP/release.jks"
+          ls -l "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.has.outputs.ok == 'true'
+        with:
+          name: android
+          path: out/*
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
-    needs: [resolve, build]
+    needs: [resolve, build, android]
     if: needs.resolve.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
