@@ -187,13 +187,13 @@ jobs:
       # 缓存 cargo 依赖下载与第三方 crate 的编译结果（依赖不变时跳过几百个库的编译）。
       # cache-workspace-crates: false（默认）在保存前删掉本项目自己的 crate 产物：公开仓库的 cache 可被间接读取，不能含自有源码的编译结果。
       # key 按目标区分：同一系统上的两个架构（Windows x64 / ARM64）不能共用一份 target 缓存；
-      # 带上年月，缓存最长用一个月就整体重建（此外 GitHub 会删除 7 天未使用的缓存，依赖或 Rust 版本变化时也会重建）
+      # 带上 ISO 周号，缓存最长用一周就整体重建；旧缓存不再命中，7 天未使用后由 GitHub 自动删除（依赖或 Rust 版本变化时也会重建）
       - name: 缓存周期
         id: cache-period
-        run: echo "month=$(date -u +%Y%m)" >> "$GITHUB_OUTPUT"
+        run: echo "week=$(date -u +%G%V)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-${{ steps.cache-period.outputs.month }}
+          key: ${{ matrix.target }}-${{ steps.cache-period.outputs.week }}
           cache-targets: true
           cache-workspace-crates: false
           workspaces: |
