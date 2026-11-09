@@ -5,7 +5,7 @@
 #
 # 触发方式：
 #   repository_dispatch (event_type: release)
-#       由源码仓库推 client-v* 标签时发来，client_payload = { ref, sha, publish }：
+#       由源码仓库推 v* 标签（客户端有改动时）发来，client_payload = { ref, sha, publish }：
 #       publish=true 时编译并以同名标签发布 Release；在源码仓库手动运行时取它的输入，
 #       publish=false 即试运行，只编译不发布。日常不用来这个仓库操作。
 #   workflow_dispatch
@@ -37,7 +37,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: '源码的标签或分支，如 client-v0.3.0 或 main'
+        description: '源码的标签或分支，如 v0.3.0 或 main'
         required: true
         default: main
       sha:
@@ -45,7 +45,7 @@ on:
         required: false
         default: ''
       publish:
-        description: '发布为 Release（只对 client-vX.Y.Z 标签生效）'
+        description: '发布为 Release（只对 vX.Y.Z 标签生效）'
         type: boolean
         default: false
 
@@ -92,10 +92,10 @@ jobs:
           if [[ ! "$ref" =~ ^[A-Za-z0-9._/-]{1,100}$ ]]; then
             echo "::error::非法 ref"; exit 1
           fi
-          if [[ "$ref" =~ ^client-v([0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)$ ]]; then
-            version="${BASH_REMATCH[1]}"
+          if [[ "$ref" =~ ^(client-)?v([0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)$ ]]; then
+            version="${BASH_REMATCH[2]}"
           elif [ "$publish" = "true" ]; then
-            echo "::error::只有 client-vX.Y.Z 标签可以发布：$ref"; exit 1
+            echo "::error::只有 vX.Y.Z 标签可以发布：$ref"; exit 1
           else
             # 分支试运行：沿用源码中的版本号
             version=""
@@ -262,7 +262,7 @@ jobs:
           GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
           TAG: ${{ needs.resolve.outputs.tag }}
           VERSION: ${{ needs.resolve.outputs.version }}
-        # 取源码仓库附注标签（git tag -a client-vX.Y.Z -m "说明"）的说明作为 Release 正文：
+        # 取源码仓库附注标签（scripts/release.sh --notes 文件）的说明作为 Release 正文：
         # 它就是 latest.json 的 notes，客户端更新提示与下载页都展示这段 Markdown
         run: |
           N="$RUNNER_TEMP/notes.md"; : > "$N"
