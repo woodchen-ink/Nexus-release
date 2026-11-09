@@ -1,0 +1,277 @@
+# 编译与发布 Nexus 桌面客户端（Windows x64 / arm64、macOS universal、Linux x64 / arm64）。
+#
+# 源码在私有仓库，编译放在这个公开仓库里跑：公开仓库的 Actions 不计分钟数，
+# 而私有仓库的 Windows runner 按 2 倍、macOS runner 按 10 倍计费。
+#
+# 触发方式：
+#   repository_dispatch (event_type: release)
+#       由源码仓库推 client-v* 标签时发来，client_payload = { ref, sha, publish }：
+#       publish=true 时编译并以同名标签发布 Release；在源码仓库手动运行时取它的输入，
+#       publish=false 即试运行，只编译不发布。日常不用来这个仓库操作。
+#   workflow_dispatch
+#       在本仓库直接手动运行（补发 / 重跑），参数同上，sha 留空时按 ref 解析。
+#
+# 两种触发都只有对本仓库有写权限的人能发起；不监听 push / pull_request，fork 发来的 PR 碰不到 secret。
+#
+# 发布契约（面板“客户端 → GitHub 发布源”按文件名识别平台、用途与签名，改名须先改面板）：
+#   - 资产沿用 Tauri 默认名：Nexus_<版本>_x64-setup.exe、Nexus_<版本>_universal.dmg、Nexus_<版本>_amd64.AppImage 等，
+#     macOS 更新包改名为 Nexus_<版本>_universal.app.tar.gz；更新包各带 .sig；外加 SHA256SUMS
+#   - 带 - 后缀的标签发布为 Pre-release
+#   - 同一标签重跑时覆盖上传资产，不新建重复 Release
+#
+# 防泄露：只缓存第三方依赖（pnpm store、cargo registry），不缓存 target 等含源码编译结果的目录；
+# artifact 只传最终安装包；Rust 路径前缀重映射，前端不生成 source map。
+#
+# Secrets：
+#   SOURCE_REPO_TOKEN                   只对源码仓库有 Contents 只读权限的 fine-grained PAT
+#   PANEL_ENDPOINTS                     客户端内置的面板地址（逗号分隔；放 secret 而非变量，避免出现在公开日志中）
+#   TAURI_SIGNING_PRIVATE_KEY、TAURI_SIGNING_PRIVATE_KEY_PASSWORD   更新包签名私钥（与 tauri.conf.json 中的公钥成对）
+# macOS 使用 tauri.conf.json 中的 ad-hoc 签名（用户首次打开需在“系统设置 → 隐私与安全性”中允许）。
+# 发布用本仓库自带的 GITHUB_TOKEN。
+
+name: Release
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '源码的标签或分支，如 client-v0.3.0 或 main'
+        required: true
+        default: main
+      sha:
+        description: '源码 commit SHA（留空按 ref 解析）'
+        required: false
+        default: ''
+      publish:
+        description: '发布为 Release（只对 client-vX.Y.Z 标签生效）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# 同一个 ref 不并发，防止重复发布
+concurrency:
+  group: release-${{ github.event.client_payload.ref || inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: woodchen-ink/Nexus
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      tag: ${{ steps.r.outputs.tag }}
+      version: ${{ steps.r.outputs.version }}
+      publish: ${{ steps.r.outputs.publish }}
+      prerelease: ${{ steps.r.outputs.prerelease }}
+    steps:
+      - name: 解析 ref / SHA / 版本号
+        id: r
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          DISPATCH_REF: ${{ github.event.client_payload.ref }}
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          DISPATCH_PUBLISH: ${{ github.event.client_payload.publish }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_SHA: ${{ inputs.sha }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [ "$EVENT" = "repository_dispatch" ]; then
+            ref="$DISPATCH_REF" sha="$DISPATCH_SHA" publish="$DISPATCH_PUBLISH"
+          else
+            ref="$INPUT_REF" sha="$INPUT_SHA" publish="$INPUT_PUBLISH"
+          fi
+          [ "$publish" = "true" ] || publish=false
+
+          if [[ ! "$ref" =~ ^[A-Za-z0-9._/-]{1,100}$ ]]; then
+            echo "::error::非法 ref"; exit 1
+          fi
+          if [[ "$ref" =~ ^client-v([0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)$ ]]; then
+            version="${BASH_REMATCH[1]}"
+          elif [ "$publish" = "true" ]; then
+            echo "::error::只有 client-vX.Y.Z 标签可以发布：$ref"; exit 1
+          else
+            # 分支试运行：沿用源码中的版本号
+            version=""
+          fi
+
+          resolved=$(gh api "repos/${SOURCE_REPO}/commits/${ref}" --jq .sha)
+          if [ -z "$sha" ]; then
+            sha="$resolved"
+          elif [ "$sha" != "$resolved" ]; then
+            # 标签被移动过：以转发时的 SHA 为准，但要让人看见
+            echo "::warning::ref 当前指向 ${resolved}，按转发的 ${sha} 构建"
+          fi
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::非法 SHA"; exit 1
+          fi
+
+          prerelease=false
+          [[ "$version" == *-* ]] && prerelease=true
+          {
+            echo "sha=$sha"
+            echo "tag=$ref"
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "ref=$ref sha=$sha version=${version:-源码版本} publish=$publish prerelease=$prerelease"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: universal-apple-darwin
+            rust: aarch64-apple-darwin,x86_64-apple-darwin
+            name: macos-universal
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rust: x86_64-pc-windows-msvc
+            name: windows-x64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            rust: aarch64-pc-windows-msvc
+            name: windows-arm64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            rust: x86_64-unknown-linux-gnu
+            name: linux-x64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            rust: aarch64-unknown-linux-gnu
+            name: linux-arm64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: src/client
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      # 去掉可执行文件中 panic 信息里的构建机路径
+      RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/build
+    steps:
+      - name: 拉取源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: src
+          # 不把 token 留在 .git/config 里，后续步骤用不到它
+          persist-credentials: false
+
+      - name: 版本号
+        if: env.VERSION != ''
+        run: node -e "const f='desktop/package.json';const p=require('./'+f);p.version=process.env.VERSION;require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: src/client/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust }}
+      # 只缓存 cargo 依赖下载，不缓存 target（含自有源码的编译结果，公开仓库的 cache 可被间接读取）
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          workspaces: |
+            src/client/desktop/src-tauri
+            src/client/service
+
+      - name: Linux 依赖
+        if: runner.os == 'Linux'
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libdbus-1-dev
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 内核与服务
+        run: pnpm --filter desktop core --target ${{ matrix.target }}
+
+      - name: 构建
+        working-directory: src/client/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NEXUS_PANEL_ENDPOINTS: ${{ secrets.PANEL_ENDPOINTS }}
+        run: |
+          case "${{ matrix.target }}" in
+            *apple*) BUNDLES=app,dmg ;;
+            *windows*) BUNDLES=nsis ;;
+            *) BUNDLES=appimage,deb ;;
+          esac
+          pnpm tauri build --target ${{ matrix.target }} --bundles $BUNDLES
+
+      - name: 收集产物
+        working-directory: src/client/desktop/src-tauri/target/${{ matrix.target }}/release/bundle
+        run: |
+          # Windows 上 GITHUB_WORKSPACE 是反斜杠路径，转成 bash 路径再用
+          WS=$(cygpath -u "$GITHUB_WORKSPACE" 2>/dev/null || echo "$GITHUB_WORKSPACE")
+          OUT="$WS/out"; mkdir -p "$OUT"
+          V=$(node -p "require(process.env.GITHUB_WORKSPACE + '/src/client/desktop/package.json').version")
+          for f in $(find . -type f | grep -E '\.(dmg|exe|AppImage|deb|app\.tar\.gz)(\.sig)?$'); do
+            n=$(basename "$f")
+            # macOS 更新包默认名 Nexus.app.tar.gz 不含版本与架构，改名后面板才能识别平台
+            case "$n" in
+              *.app.tar.gz|*.app.tar.gz.sig) n="${n%%.app.tar.gz*}_${V}_universal.app.tar.gz${n##*.app.tar.gz}" ;;
+            esac
+            cp -f "$f" "$OUT/$n"
+          done
+          ls -l "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+          # 只给本次 publish 用，正式产物在 Release 里
+          retention-days: 1
+
+  publish:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 校验和
+        working-directory: dist
+        run: sha256sum Nexus* > SHA256SUMS && cat SHA256SUMS
+
+      - name: 发布 Release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # 重跑：覆盖同名资产，不新建 Release
+            gh release upload "$TAG" Nexus* SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            args=(--repo "$GITHUB_REPOSITORY" --title "客户端 v${VERSION}" --notes "Nexus 客户端 v${VERSION}")
+            [ "$PRERELEASE" = "true" ] && args+=(--prerelease)
+            gh release create "$TAG" Nexus* SHA256SUMS "${args[@]}"
+          fi
