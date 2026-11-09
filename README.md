@@ -1,17 +1,18 @@
 # Nexus 客户端发布
 
-本仓库只用于构建与发布 Nexus 桌面客户端安装包，不包含源码。安装包在 [Releases](../../releases) 页面。
+本仓库只用于构建与发布 Nexus 桌面客户端安装包，不包含源码。安装包在 [Releases](../../releases) 页面，也通过 CZL Connect 的固定地址分发（客户端自动更新读取 `https://connect.czl.net/dl/nexus/latest.json`）。
 
 ## 下载
 
-| 系统 | 文件 |
-|------|------|
-| Windows 10 / 11（x64） | `Nexus_<版本>_x64-setup.exe` |
-| Windows 11（ARM） | `Nexus_<版本>_arm64-setup.exe` |
-| macOS 12 及以上（Intel / Apple 芯片） | `Nexus_<版本>_universal.dmg` |
-| Linux（x64 / ARM64） | `Nexus_<版本>_amd64.AppImage` / `Nexus_<版本>_aarch64.AppImage`，或对应的 `.deb` |
+| 系统 | 文件 | CZL Connect 别名 |
+|------|------|------|
+| Windows 10 / 11（x64） | `Nexus_<版本>_x64-setup.exe` | `windows-x64` |
+| Windows 11（ARM） | `Nexus_<版本>_arm64-setup.exe` | `windows-arm64` |
+| macOS 12 及以上（Intel / Apple 芯片） | `Nexus_<版本>_universal.dmg` | `macos-universal` |
+| Linux x64（Ubuntu / Debian 等） | `Nexus_<版本>_amd64.deb` | `linux-x64-deb` |
+| Linux ARM64（Ubuntu / Debian 等） | `Nexus_<版本>_arm64.deb` | `linux-arm64-deb` |
 
-`.sig`、`.app.tar.gz` 是自动更新使用的文件，不需要手动下载。可用 `SHA256SUMS` 校验下载的文件。
+`Nexus_<版本>_universal.app.tar.gz`（别名 `macos-update`，不在下载页显示）是 macOS 自动更新使用的文件，不需要手动下载。可用 `SHA256SUMS` 校验下载的文件；客户端自动更新时按 CZL Connect 清单中的大小与 SHA-256 校验，不符时不会安装。
 
 ## 安装位置
 

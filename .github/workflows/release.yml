@@ -13,9 +13,10 @@
 #
 # 两种触发都只有对本仓库有写权限的人能发起；不监听 push / pull_request，fork 发来的 PR 碰不到 secret。
 #
-# 发布契约（面板“客户端 → GitHub 发布源”按文件名识别平台、用途与签名，改名须先改面板）：
-#   - 资产沿用 Tauri 默认名：Nexus_<版本>_x64-setup.exe、Nexus_<版本>_universal.dmg、Nexus_<版本>_amd64.AppImage 等，
-#     macOS 更新包改名为 Nexus_<版本>_universal.app.tar.gz；更新包各带 .sig；外加 SHA256SUMS
+# 发布契约（CZL Connect 发布源按别名匹配附件名，客户端自动更新与面板下载页都读它的 latest.json，改名须先改别名）：
+#   - 资产沿用 Tauri 默认名：Nexus_<版本>_x64-setup.exe、Nexus_<版本>_arm64-setup.exe、Nexus_<版本>_universal.dmg、
+#     Nexus_<版本>_amd64.deb、Nexus_<版本>_arm64.deb（AppImage 暂不发布）；macOS 另打 Nexus_<版本>_universal.app.tar.gz
+#     供自动更新替换 .app；外加 SHA256SUMS。完整性由 CZL Connect 清单中的 size 与 sha256 校验
 #   - 带 - 后缀的标签发布为 Pre-release
 #   - 同一标签重跑时覆盖上传资产，不新建重复 Release
 #
@@ -25,7 +26,6 @@
 # Secrets：
 #   SOURCE_REPO_TOKEN                   只对源码仓库有 Contents 只读权限的 fine-grained PAT
 #   PANEL_ENDPOINTS                     客户端内置的面板地址（逗号分隔；放 secret 而非变量，避免出现在公开日志中）
-#   TAURI_SIGNING_PRIVATE_KEY、TAURI_SIGNING_PRIVATE_KEY_PASSWORD   更新包签名私钥（与 tauri.conf.json 中的公钥成对）
 # macOS 使用 tauri.conf.json 中的 ad-hoc 签名（用户首次打开需在“系统设置 → 隐私与安全性”中允许）。
 # 发布用本仓库自带的 GITHUB_TOKEN。
 
@@ -207,14 +207,13 @@ jobs:
       - name: 构建
         working-directory: src/client/desktop
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           NEXUS_PANEL_ENDPOINTS: ${{ secrets.PANEL_ENDPOINTS }}
         run: |
           case "${{ matrix.target }}" in
             *apple*) BUNDLES=app,dmg ;;
             *windows*) BUNDLES=nsis ;;
-            *) BUNDLES=appimage,deb ;;
+            # Linux 暂只发布 deb；恢复 AppImage 时改回 appimage,deb，并在 CZL Connect 加回 linux-x64 / linux-arm64 别名
+            *) BUNDLES=deb ;;
           esac
           pnpm tauri build --target ${{ matrix.target }} --bundles $BUNDLES
 
@@ -225,14 +224,13 @@ jobs:
           WS=$(cygpath -u "$GITHUB_WORKSPACE" 2>/dev/null || echo "$GITHUB_WORKSPACE")
           OUT="$WS/out"; mkdir -p "$OUT"
           V=$(node -p "require(process.env.GITHUB_WORKSPACE + '/src/client/desktop/package.json').version")
-          for f in $(find . -type f | grep -E '\.(dmg|exe|AppImage|deb|app\.tar\.gz)(\.sig)?$'); do
-            n=$(basename "$f")
-            # macOS 更新包默认名 Nexus.app.tar.gz 不含版本与架构，改名后面板才能识别平台
-            case "$n" in
-              *.app.tar.gz|*.app.tar.gz.sig) n="${n%%.app.tar.gz*}_${V}_universal.app.tar.gz${n##*.app.tar.gz}" ;;
-            esac
-            cp -f "$f" "$OUT/$n"
+          for f in $(find . -type f | grep -E '\.(dmg|exe|AppImage|deb)$'); do
+            cp -f "$f" "$OUT/$(basename "$f")"
           done
+          # macOS 自动更新包：客户端校验后解压并替换当前 .app（COPYFILE_DISABLE 避免打入 ._ 资源分叉文件）
+          if [ -d macos/Nexus.app ]; then
+            COPYFILE_DISABLE=1 tar -czf "$OUT/Nexus_${V}_universal.app.tar.gz" -C macos Nexus.app
+          fi
           ls -l "$OUT"
 
       - uses: actions/upload-artifact@v4
@@ -259,6 +257,25 @@ jobs:
         working-directory: dist
         run: sha256sum Nexus* > SHA256SUMS && cat SHA256SUMS
 
+      - name: 更新说明
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        # 取源码仓库附注标签（git tag -a client-vX.Y.Z -m "说明"）的说明作为 Release 正文：
+        # 它就是 latest.json 的 notes，客户端更新提示与下载页都展示这段 Markdown
+        run: |
+          N="$RUNNER_TEMP/notes.md"; : > "$N"
+          read -r type sha < <(gh api "repos/${SOURCE_REPO}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha')
+          if [ "$type" = "tag" ]; then
+            gh api "repos/${SOURCE_REPO}/git/tags/${sha}" --jq .message | sed '/-----BEGIN PGP SIGNATURE-----/,$d' > "$N"
+          fi
+          if [ -z "$(tr -d '[:space:]' < "$N")" ]; then
+            echo "Nexus 客户端 v${VERSION}" > "$N"
+            echo "::warning::标签 ${TAG} 不是附注标签或没有说明，Release 正文使用默认文字"
+          fi
+          cat "$N"
+
       - name: 发布 Release
         working-directory: dist
         env:
@@ -268,10 +285,11 @@ jobs:
           PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
         run: |
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # 重跑：覆盖同名资产，不新建 Release
+            # 重跑：覆盖同名资产与说明，不新建 Release
             gh release upload "$TAG" Nexus* SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/notes.md"
           else
-            args=(--repo "$GITHUB_REPOSITORY" --title "客户端 v${VERSION}" --notes "Nexus 客户端 v${VERSION}")
+            args=(--repo "$GITHUB_REPOSITORY" --title "客户端 v${VERSION}" --notes-file "$RUNNER_TEMP/notes.md")
             [ "$PRERELEASE" = "true" ] && args+=(--prerelease)
             gh release create "$TAG" Nexus* SHA256SUMS "${args[@]}"
           fi
