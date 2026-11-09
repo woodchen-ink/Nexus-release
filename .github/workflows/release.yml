@@ -20,7 +20,7 @@
 #   - 带 - 后缀的标签发布为 Pre-release
 #   - 同一标签重跑时覆盖上传资产，不新建重复 Release
 #
-# 防泄露：只缓存第三方依赖（pnpm store、cargo registry），不缓存 target 等含源码编译结果的目录；
+# 防泄露：只缓存第三方依赖（pnpm store、cargo registry、第三方 crate 的编译结果），不缓存本项目自身的编译结果；
 # artifact 只传最终安装包；Rust 路径前缀重映射，前端不生成 source map。
 #
 # Secrets：
@@ -184,10 +184,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust }}
-      # 只缓存 cargo 依赖下载，不缓存 target（含自有源码的编译结果，公开仓库的 cache 可被间接读取）
+      # 缓存 cargo 依赖下载与第三方 crate 的编译结果（依赖不变时跳过几百个库的编译）。
+      # cache-workspace-crates: false（默认）在保存前删掉本项目自己的 crate 产物：公开仓库的 cache 可被间接读取，不能含自有源码的编译结果。
+      # key 按目标区分：同一系统上的两个架构（Windows x64 / ARM64）不能共用一份 target 缓存
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-targets: false
+          key: ${{ matrix.target }}
+          cache-targets: true
+          cache-workspace-crates: false
           workspaces: |
             src/client/desktop/src-tauri
             src/client/service
