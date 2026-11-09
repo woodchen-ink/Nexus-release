@@ -342,7 +342,7 @@ jobs:
           MOBILE=$(cd android/libcore && GOWORK=off go list -m -f '{{.Version}}' golang.org/x/mobile)
           go install golang.org/x/mobile/cmd/gomobile@$MOBILE golang.org/x/mobile/cmd/gobind@$MOBILE
           gomobile init
-          android/build-core.sh android/arm64,android/amd64
+          bash android/build-core.sh android/arm64,android/amd64
 
       - name: 签名密钥
         if: steps.has.outputs.ok == 'true'
