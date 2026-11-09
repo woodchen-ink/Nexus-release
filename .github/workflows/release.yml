@@ -338,8 +338,8 @@ jobs:
       - name: 内核 AAR
         if: steps.has.outputs.ok == 'true'
         run: |
-          # gomobile 与 libcore 依赖的 golang.org/x/mobile 同一版本
-          MOBILE=$(cd android/libcore && go list -m -f '{{.Version}}' golang.org/x/mobile)
+          # gomobile 与 libcore 依赖的 golang.org/x/mobile 同一版本；libcore 不在源码根目录的 go.work 中，需关闭工作区
+          MOBILE=$(cd android/libcore && GOWORK=off go list -m -f '{{.Version}}' golang.org/x/mobile)
           go install golang.org/x/mobile/cmd/gomobile@$MOBILE golang.org/x/mobile/cmd/gobind@$MOBILE
           gomobile init
           android/build-core.sh android/arm64,android/amd64
