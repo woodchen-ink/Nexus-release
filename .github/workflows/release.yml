@@ -285,10 +285,23 @@ jobs:
           codesign --display --verbose=2 "$APP" 2>&1 | grep -E "Authority|TeamIdentifier|flags"
           codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG"
           AUTH=(--key "$RUNNER_TEMP/AuthKey.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER")
-          RESULT=$(xcrun notarytool submit "$DMG" "${AUTH[@]}" --wait --timeout 2h --output-format json) || true
-          echo "$RESULT"
-          STATUS=$(echo "$RESULT" | jq -r '.status // empty')
-          SUBMISSION=$(echo "$RESULT" | jq -r '.id // empty')
+          # 提交与等待分开：notarytool 的 --wait 遇到一次网络抖动就整体失败（首次公证常要排队几十分钟），
+          # 这里提交失败重试 3 次，之后每 30 秒查一次状态，单次查询失败不算失败，最多等 2 小时
+          SUBMISSION=
+          for i in 1 2 3; do
+            SUBMISSION=$(xcrun notarytool submit "$DMG" "${AUTH[@]}" --output-format json | jq -r '.id // empty') || true
+            [ -n "$SUBMISSION" ] && break
+            sleep 30
+          done
+          [ -n "$SUBMISSION" ] || { echo "::error::公证提交失败"; exit 1; }
+          echo "公证提交 ID：$SUBMISSION"
+          STATUS=
+          for i in $(seq 1 240); do
+            STATUS=$(xcrun notarytool info "$SUBMISSION" "${AUTH[@]}" --output-format json 2>/dev/null | jq -r '.status // empty') || true
+            [ -n "$STATUS" ] && [ "$STATUS" != "In Progress" ] && break
+            sleep 30
+          done
+          echo "公证状态：${STATUS:-无结果}"
           if [ "$STATUS" != "Accepted" ]; then
             [ -n "$SUBMISSION" ] && xcrun notarytool log "$SUBMISSION" "${AUTH[@]}"
             echo "::error::公证未通过（${STATUS:-无结果}）"
